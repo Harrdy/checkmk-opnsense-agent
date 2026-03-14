@@ -532,6 +532,46 @@ class checkmk_checker(object):
             pass
         return _ifs
 
+    @staticmethod
+    def _parse_ps_etime(etime):
+        _etime = etime.strip()
+        _match = re.match(r"(?:(?P<days>\d+)-)?(?:(?P<hours>\d+):)?(?P<minutes>\d+):(?P<seconds>\d+)$",_etime)
+        if not _match:
+            return None
+        _days = int(_match.group("days") or 0)
+        _hours = int(_match.group("hours") or 0)
+        _minutes = int(_match.group("minutes") or 0)
+        _seconds = int(_match.group("seconds") or 0)
+        return (_days * 86400) + (_hours * 3600) + (_minutes * 60) + _seconds
+
+    def _get_pppoe_uptimes(self):
+        _interface_map = {}
+        for _name,_interface in self._config_reader().get("interfaces",{}).items():
+            if _interface.get("enable") != "1":
+                continue
+            _ifname = _interface.get("if")
+            if _ifname and _ifname.lower().startswith("pppoe"):
+                _interface_map[_name.lower()] = _ifname
+        if not _interface_map:
+            return {}
+        _uptimes = {}
+        _ps_out = self._run_prog("ps ax -o etime=,command=")
+        for _line in _ps_out.splitlines():
+            _match = re.match(r"^\s*(\S+)\s+(.*)$",_line)
+            if not _match:
+                continue
+            _etime,_command = _match.groups()
+            if "/usr/local/sbin/mpd5" not in _command:
+                continue
+            _iface_match = re.search(r"(?:mpd|pppoe)_((?:wan|opt\d+))\.(?:conf|pid)",_command,re.I)
+            if not _iface_match:
+                continue
+            _ifname = _interface_map.get(_iface_match.group(1).lower())
+            _uptime = self._parse_ps_etime(_etime)
+            if _ifname and _uptime is not None:
+                _uptimes[_ifname] = _uptime
+        return _uptimes
+
     def checklocal_firmware(self):
         if self._info.get("os_version") != self._info.get("latest_version"):
             return ["1 Firmware update_available=1|last_updated={version_age:.0f}|apply_finish_time={config_age:.0f} Version {os_version} ({latest_version} available {latest_date}) Config changed: {last_configchange}".format(**self._info)]
@@ -554,6 +594,7 @@ class checkmk_checker(object):
     def check_net(self):
         _now = int(time.time())
         _opnsense_ifs = self.get_opnsense_interfaces()
+        _pppoe_uptimes = self._get_pppoe_uptimes()
         _ret = ["<<<statgrab_net>>>"]
         _interface_data = []
         _interface_data = self._run_prog("/usr/bin/netstat -i -b -d -n -W -f link").split("\n")
@@ -664,8 +705,10 @@ class checkmk_checker(object):
             #    continue
             if not _opnsense_ifs.get(_interface):
                 continue
+            if _interface.lower().startswith("pppoe") and _pppoe_uptimes.get(_interface) is not None:
+                _interface_dict["uptime"] = _pppoe_uptimes.get(_interface)
             for _key,_val in _interface_dict.items():
-                if _key in ("mtu","ipackets","ierrors","idrop","rx","opackets","oerrors","tx","collisions","drop","interface_name","up","systime","phys_address","speed","duplex"):
+                if _key in ("mtu","ipackets","ierrors","idrop","rx","opackets","oerrors","tx","collisions","drop","interface_name","up","systime","phys_address","speed","duplex","uptime"):
                     if type(_val) in (str,int,float):
                         _sanitized_interface = _interface.replace(".","_")
                         _ret.append(f"{_sanitized_interface}.{_key} {_val}")
