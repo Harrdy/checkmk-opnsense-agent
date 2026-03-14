@@ -41,6 +41,7 @@ import glob
 import re
 import time
 import json
+import csv
 import socket
 import signal
 import struct
@@ -447,7 +448,7 @@ class checkmk_checker(object):
         return socket.inet_ntoa(struct.pack("!I",intaddr))
 
     def pidof(self,prog,default=None):
-        _allprogs = re.findall(r"(\w+)\s+(\d+)",self._run_prog("ps ax -c -o command,pid"))
+        _allprogs = re.findall(r"([\w.-]+)\s+(\d+)",self._run_prog("ps ax -c -o command,pid"))
         return int(dict(_allprogs).get(prog,default))
 
     def _config_reader(self,config=""):
@@ -716,13 +717,171 @@ class checkmk_checker(object):
         return _ret
 
     def check_dhcp(self):
+        _isc_dhcp = self._get_isc_dhcp_data()
+        if _isc_dhcp:
+            return _isc_dhcp
+        _kea_dhcp = self._get_kea_dhcp_data()
+        if _kea_dhcp:
+            return _kea_dhcp
+        return []
+
+    @staticmethod
+    def _ensure_list(value):
+        if value is None:
+            return []
+        if type(value) == list:
+            return value
+        return [value]
+
+    def _find_nested_key(self,data,key):
+        _results = []
+        if type(data) == dict:
+            for _subkey,_subvalue in data.items():
+                if _subkey == key:
+                    _results.append(_subvalue)
+                _results.extend(self._find_nested_key(_subvalue,key))
+        elif type(data) == list:
+            for _item in data:
+                _results.extend(self._find_nested_key(_item,key))
+        return _results
+
+    def _parse_kea_pool(self,pool):
+        if type(pool) == dict:
+            _range = pool.get("range")
+            if type(_range) == dict and _range.get("from") and _range.get("to"):
+                return (_range.get("from"),_range.get("to"))
+            for _key in ("pool","value","range"):
+                if pool.get(_key):
+                    _parsed = self._parse_kea_pool(pool.get(_key))
+                    if _parsed:
+                        return _parsed
+            if pool.get("from") and pool.get("to"):
+                return (pool.get("from"),pool.get("to"))
+            return None
+        if type(pool) != str:
+            return None
+        _pool = pool.strip()
+        _match = re.match(r"^([0-9.]+)\s*-\s*([0-9.]+)$",_pool)
+        if _match:
+            return _match.groups()
+        try:
+            _network = ipaddress.ip_network(_pool,strict=False)
+            if _network.version != 4 or _network.num_addresses < 4:
+                return None
+            return (str(_network.network_address + 1),str(_network.broadcast_address - 1))
+        except:
+            return None
+
+    def _get_kea_pools(self):
+        _pools = []
+        _kea_conf = "/usr/local/etc/kea/kea-dhcp4.conf"
+        if os.path.exists(_kea_conf):
+            try:
+                _dhcp4 = json.loads(open(_kea_conf,"r").read()).get("Dhcp4",{})
+                for _subnet in self._ensure_list(_dhcp4.get("subnet4")):
+                    for _pool in self._ensure_list(_subnet.get("pools")):
+                        _parsed = self._parse_kea_pool(_pool)
+                        if _parsed:
+                            _pools.append(_parsed)
+            except:
+                pass
+        if _pools:
+            return sorted(set(_pools),key=lambda x: self.ip2int(x[0]))
+        _config = self._config_reader()
+        for _subnets in self._find_nested_key(_config,"subnet4"):
+            for _subnet in self._ensure_list(_subnets):
+                if type(_subnet) != dict:
+                    continue
+                for _pool in self._ensure_list(_subnet.get("pools") or _subnet.get("pool")):
+                    _parsed = self._parse_kea_pool(_pool)
+                    if _parsed:
+                        _pools.append(_parsed)
+                if _pools:
+                    continue
+                if _subnet.get("subnet"):
+                    _parsed = self._parse_kea_pool(_subnet.get("subnet"))
+                    if _parsed:
+                        _pools.append(_parsed)
+        return sorted(set(_pools),key=lambda x: self.ip2int(x[0]))
+
+    @staticmethod
+    def _is_kea_lease_active(lease):
+        _state = str(lease.get("state","")).strip().lower()
+        if _state in ("1","2","declined","expired-reclaimed","expired_reclaimed","reclaimed","released"):
+            return False
+        try:
+            _expire = int(float(lease.get("expire",0)))
+            if _expire > 0 and _expire < time.time():
+                return False
+        except:
+            pass
+        return True
+
+    def _read_kea_lease_file(self,leasefile):
+        _leases = {}
+        if not os.path.exists(leasefile):
+            return _leases
+        try:
+            with open(leasefile,newline="") as _handle:
+                _reader = csv.DictReader(_handle)
+                for _row in _reader:
+                    _ipaddr = (_row.get("address") or _row.get("ip-address") or "").strip()
+                    try:
+                        if ipaddress.ip_address(_ipaddr).version != 4:
+                            continue
+                    except:
+                        continue
+                    if not self._is_kea_lease_active(_row):
+                        _leases.pop(_ipaddr,None)
+                        continue
+                    _leases[_ipaddr] = _row
+        except:
+            pass
+        return _leases
+
+    def _get_kea_lease_files(self):
+        _leasefiles = []
+        for _basefile in (
+            "/var/lib/kea/dhcp4.leases",
+            "/var/lib/kea/kea-leases4.csv",
+            "/var/db/kea/dhcp4.leases",
+            "/var/db/kea/kea-leases4.csv",
+        ):
+            for _leasefile in (_basefile,f"{_basefile}.2"):
+                if os.path.exists(_leasefile):
+                    _leasefiles.append(_leasefile)
+        return _leasefiles
+
+    def _get_kea_dhcp_data(self):
+        _leasefiles = self._get_kea_lease_files()
+        _pid = self.pidof("kea-dhcp4",-1)
+        _pools = self._get_kea_pools()
+        if not _leasefiles and _pid < 0 and not _pools:
+            return []
+        _leases = {}
+        for _leasefile in _leasefiles:
+            _leases.update(self._read_kea_lease_file(_leasefile))
+        _ret = ["<<<isc_dhcpd>>>"]
+        _ret.append("[general]\nPID: {0}".format(_pid))
+        _ret.append("[pools]")
+        for _range in _pools:
+            _ret.append("{0}\t{1}".format(*_range))
+        _ret.append("[leases]")
+        for _ipaddr in sorted(_leases.keys(),key=self.ip2int):
+            _ret.append(_ipaddr)
+        return _ret
+
+    def _get_isc_dhcp_data(self):
         _dhcp = self._config_reader().get("dhcpd")
-        if  type(_dhcp) != dict or not os.path.exists("/var/dhcpd/var/db/dhcpd.leases"):
+        _leasefile = "/var/dhcpd/var/db/dhcpd.leases"
+        _pid = self.pidof("dhcpd",-1)
+        _is_enabled = type(_dhcp) == dict and any(_item.get("enable") == "1" for _item in _dhcp.values() if type(_item) == dict)
+        if not _is_enabled or not os.path.exists(_leasefile):
             return []
         _ret = ["<<<isc_dhcpd>>>"]
-        _ret.append("[general]\nPID: {0}".format(self.pidof("dhcpd",-1)))
+        _ret.append("[general]\nPID: {0}".format(_pid))
         
-        _dhcpleases = open("/var/dhcpd/var/db/dhcpd.leases","r").read()
+        _dhcpleases = open(_leasefile,"r").read()
         ## FIXME 
         #_dhcpleases_dict = dict(map(lambda x: (self.ip2int(x[0]),x[1]),re.findall(r"lease\s(?P<ipaddr>[0-9.]+)\s\{.*?.\n\s+binding state\s(?P<state>\w+).*?\}",_dhcpleases,re.DOTALL)))
         _dhcpleases_dict = dict(re.findall(r"lease\s(?P<ipaddr>[0-9.]+)\s\{.*?.\n\s+binding state\s(?P<state>active).*?\}",_dhcpleases,re.DOTALL))
@@ -742,7 +901,7 @@ class checkmk_checker(object):
                 _ret.append("{from}\t{to}".format(**_range))
 
         _ret.append("[leases]")
-        for _ip in sorted(_dhcpleases_dict.keys()):
+        for _ip in sorted(_dhcpleases_dict.keys(),key=self.ip2int):
             _ret.append(_ip)
         return _ret
 
